@@ -1,0 +1,10 @@
+{
+    "comment": "Media Tools",
+    "pacman_packages": [],
+    "nix_packages": [
+        "vlc",
+        "obs-studio"
+		"git"
+		"iftop"
+    ]
+}

@@ -1,0 +1,9 @@
+{
+    "comment": "Base Security & System Tools",
+    "pacman_packages": [
+        "clamav", "rkhunter", "lynis", "binwalk", "usbguard", "btrbk", "nix", "mbuffer"
+    ],
+    "nix_packages": [
+        "hello", "python3", "bashInteractive"
+    ]
+}

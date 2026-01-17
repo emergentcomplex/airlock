@@ -1,0 +1,8 @@
+{
+    "comment": "Development IDEs",
+    "pacman_packages": [],
+    "nix_packages": [
+        "vscodium",
+        "postman"
+    ]
+}
