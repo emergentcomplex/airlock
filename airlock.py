@@ -4,8 +4,9 @@ from pathlib import Path
 
 # --- CONFIGURATION ---
 APP_NAME = "AIRLOCK PROTOCOL"
-VERSION = "v8.0.0 (Modular)"
-MOUNT_POINT = Path("/mnt/usbc")
+VERSION = "v11.0.0 (Canonical)"
+# UNIFIED MOUNT POINT: All scripts must use this path.
+MOUNT_POINT = Path("/mnt/airlock")
 REPO_DIR = MOUNT_POINT / "repo"
 NIX_TRANSFER_DIR = MOUNT_POINT / "nix_transfer"
 CACHE_DIR = Path("/var/cache/pacman/pkg")
@@ -27,7 +28,7 @@ class TUI:
     def banner():
         os.system('clear')
         print(f"{TUI.BOLD}{TUI.CYAN}╔══════════════════════════════════════════════════════════════╗{TUI.ENDC}")
-        print(f"{TUI.BOLD}{TUI.CYAN}║  {APP_NAME} {VERSION}                           ║{TUI.ENDC}")
+        print(f"{TUI.BOLD}{TUI.CYAN}║  {APP_NAME} {VERSION}                         ║{TUI.ENDC}")
         print(f"{TUI.BOLD}{TUI.CYAN}╚══════════════════════════════════════════════════════════════╝{TUI.ENDC}")
         print("")
 
@@ -77,25 +78,34 @@ def run_cmd(cmd, cwd=None, capture=False, check=True, shell=False):
         if not capture: print("")
         TUI.fail(f"Command failed: {cmd}\nError: {e.stderr if capture else 'See output above'}")
 
+def load_config(config_path):
+    if not Path(config_path).exists():
+        # Create default if missing
+        default_conf = {
+            "comment": "Master Air-Gap Configuration",
+            "pacman_packages": ["clamav", "rkhunter", "lynis", "binwalk", "usbguard", "btrbk", "nix", "mbuffer"],
+            "nix_packages": ["hello", "python3", "bashInteractive"]
+        }
+        with open(config_path, 'w') as f: json.dump(default_conf, f, indent=4)
+        return default_conf
+    with open(config_path, 'r') as f: return json.load(f)
+
 def load_configs(config_paths):
-    """Merges multiple JSON config files into one master dictionary."""
     master_config = {"pacman_packages": [], "nix_packages": []}
-    
     for path in config_paths:
         p = Path(path)
-        if not p.exists():
-            TUI.fail(f"Config file not found: {path}")
-        
+        if not p.exists(): TUI.fail(f"Config file not found: {path}")
         with open(p, 'r') as f:
             data = json.load(f)
             master_config["pacman_packages"].extend(data.get("pacman_packages", []))
             master_config["nix_packages"].extend(data.get("nix_packages", []))
             TUI.info(f"Loaded: {p.name}")
-
-    # Deduplicate
     master_config["pacman_packages"] = sorted(list(set(master_config["pacman_packages"])))
     master_config["nix_packages"] = sorted(list(set(master_config["nix_packages"])))
     return master_config
+
+def save_config(config_path, data):
+    with open(config_path, 'w') as f: json.dump(data, f, indent=4)
 
 def auto_mount_usb():
     if MOUNT_POINT.is_mount(): return
@@ -125,6 +135,95 @@ def calculate_sha256(filepath):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
+# --- PACKAGE MANAGEMENT ---
+def interactive_search(config_path):
+    TUI.banner()
+    if not os.path.exists("/nix/var/nix/profiles/per-user/root/channels/nixpkgs"):
+        TUI.fail("Root Nix channel not found. Run 'sudo -i nix-channel --update' on Rig A.")
+
+    while True:
+        print(f"\n{TUI.BOLD}--- Interactive Package Search ---{TUI.ENDC}")
+        query = input(f"Enter search term (or 'q' to quit, 'l' to list current): ").strip()
+        if query.lower() == 'q': break
+        if query.lower() == 'l':
+            list_manifest(config_path)
+            continue
+        if not query: continue
+
+        cmd = ["nix-env", "-I", NIX_CHANNEL_PATH, "-qaP", f".*{query}.*", "--description"]
+        with Spinner("Querying Nix Universe..."):
+            try: output = run_cmd(cmd, capture=True, check=False)
+            except: output = ""
+
+        if not output:
+            TUI.warn("No packages found.")
+            continue
+
+        lines = output.splitlines()
+        results = []
+        print(f"\n    {'ID':<4} {'PACKAGE NAME':<30} {'VERSION':<15} {'DESCRIPTION'}")
+        print(f"    {'-'*4} {'-'*30} {'-'*15} {'-'*30}")
+
+        for idx, line in enumerate(lines[:20]):
+            parts = line.split(maxsplit=2)
+            if len(parts) >= 2:
+                raw_name = parts[0]
+                version = parts[1]
+                desc = parts[2] if len(parts) > 2 else ""
+                clean_name = raw_name.replace("nixpkgs.", "")
+                results.append(clean_name)
+                if len(desc) > 50: desc = desc[:47] + "..."
+                TUI.table_row(idx+1, clean_name, version, desc)
+
+        if len(lines) > 20: print(f"    ... and {len(lines) - 20} more results.")
+        print("")
+        selection = input(f"Enter IDs to add (e.g. '1 3 5') or 'a' for all visible: ")
+        
+        to_add = []
+        if selection.lower() == 'a': to_add = results
+        else:
+            for s in selection.split():
+                if s.isdigit():
+                    i = int(s) - 1
+                    if 0 <= i < len(results): to_add.append(results[i])
+        
+        if to_add: batch_add(to_add, config_path)
+
+def batch_add(packages, config_path):
+    data = load_config(config_path)
+    added_count = 0
+    for pkg in packages:
+        if pkg not in data['nix_packages']:
+            data['nix_packages'].append(pkg)
+            added_count += 1
+            print(f"    + Added: {pkg}")
+        else: print(f"    . Skipping {pkg} (Already exists)")
+    
+    if added_count > 0:
+        data['nix_packages'].sort()
+        save_config(config_path, data)
+        TUI.success(f"Saved {added_count} new packages to manifest.")
+
+def batch_remove(packages, config_path):
+    data = load_config(config_path)
+    removed_count = 0
+    for pkg in packages:
+        if pkg in data['nix_packages']:
+            data['nix_packages'].remove(pkg)
+            removed_count += 1
+            print(f"    - Removed: {pkg}")
+        else: TUI.warn(f"Package '{pkg}' not found in manifest.")
+    
+    if removed_count > 0:
+        save_config(config_path, data)
+        TUI.success(f"Removed {removed_count} packages.")
+
+def list_manifest(config_path):
+    data = load_config(config_path)
+    print(f"\n{TUI.BOLD}Current Nix Packages in Manifest:{TUI.ENDC}")
+    for pkg in data['nix_packages']: print(f"  - {pkg}")
+    print(f"Total: {len(data['nix_packages'])}")
+
 # --- HARVEST MODE ---
 def harvest(config_paths):
     TUI.banner()
@@ -133,18 +232,25 @@ def harvest(config_paths):
 
     auto_mount_usb()
     
-    # Load and Merge Configs
-    TUI.step("Loading Configurations")
-    config = load_configs(config_paths)
+    # CLEANUP: Remove old transfers to save space
+    if NIX_TRANSFER_DIR.exists():
+        TUI.step("Cleaning old transfers...")
+        shutil.rmtree(NIX_TRANSFER_DIR)
     
     REPO_DIR.mkdir(parents=True, exist_ok=True)
     NIX_TRANSFER_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 1. PACMAN HARVEST
     TUI.step("Harvesting Pacman Packages")
-    installed = run_cmd([PACMAN_BIN, "-Qq"], capture=True).splitlines()
-    targets = sorted(list(set(installed + config['pacman_packages'])))
+    all_pacman_pkgs = []
+    for path in config_paths:
+        cfg = load_config(path)
+        all_pacman_pkgs.extend(cfg.get('pacman_packages', []))
     
-    with Spinner(f"Processing {len(targets)} packages..."):
+    installed = run_cmd([PACMAN_BIN, "-Qq"], capture=True).splitlines()
+    targets = sorted(list(set(installed + all_pacman_pkgs)))
+    
+    with Spinner(f"Processing {len(targets)} system packages..."):
         for pkg in targets:
             matches = list(CACHE_DIR.glob(f"{pkg}-[0-9]*.pkg.tar.zst"))
             if matches:
@@ -167,31 +273,47 @@ def harvest(config_paths):
     clam_dest.mkdir(exist_ok=True)
     for db in Path("/var/lib/clamav").glob("*.cvd"): shutil.copy2(db, clam_dest)
 
-    TUI.step("Harvesting Nix Environment")
-    nix_file = Path("/tmp/generated_tools.nix")
-    pkgs_string = " ".join(config['nix_packages'])
-    nix_content = f"""
+    # 2. NIX HARVEST (Layered)
+    TUI.step("Harvesting Nix Layers")
+    
+    for path in config_paths:
+        cfg_path = Path(path)
+        cfg = load_config(cfg_path)
+        layer_name = cfg_path.stem
+        nix_pkgs = cfg.get('nix_packages', [])
+        
+        if not nix_pkgs:
+            TUI.info(f"Skipping {layer_name} (No Nix packages)")
+            continue
+
+        TUI.info(f"Processing Layer: {layer_name}")
+        nix_file = Path(f"/tmp/generated_{layer_name}.nix")
+        pkgs_string = " ".join(nix_pkgs)
+        nix_content = f"""
 {{ pkgs ? import <nixpkgs> {{ config = {{ allowUnfree = true; }}; overlays = []; }} }}:
 pkgs.buildEnv {{
-  name = "airgap-tools";
+  name = "airgap-{layer_name}";
   paths = with pkgs; [ {pkgs_string} ];
 }}
 """
-    with open(nix_file, 'w') as f: f.write(nix_content)
-    
-    with Spinner("Building Nix Closure (This takes time)..."):
-        drv_path = run_cmd(["nix-build", str(nix_file), "-I", NIX_CHANNEL_PATH], capture=True)
-    
-    with Spinner("Exporting to USB..."):
-        export_file = NIX_TRANSFER_DIR / "tools.closure"
-        with open(export_file, "wb") as outfile:
-            reqs = run_cmd(["nix-store", "-qR", drv_path], capture=True).splitlines()
-            subprocess.run(["nix-store", "--export"] + reqs, stdout=outfile, check=True)
-    
-    # INTEGRITY: Generate Hash
-    with Spinner("Generating Integrity Hash..."):
+        with open(nix_file, 'w') as f: f.write(nix_content)
+        
+        with Spinner(f"  Building {layer_name}..."):
+            drv_path = run_cmd(["nix-build", str(nix_file), "-I", NIX_CHANNEL_PATH], capture=True)
+        
+        export_file = NIX_TRANSFER_DIR / f"{layer_name}.closure"
+        hash_file = export_file.with_suffix(".sha256")
+        
+        with Spinner(f"  Exporting {layer_name} to USB..."):
+            with open(export_file, "wb") as outfile:
+                reqs = run_cmd(["nix-store", "-qR", drv_path], capture=True).splitlines()
+                subprocess.run(["nix-store", "--export"] + reqs, stdout=outfile, check=True)
+        
         file_hash = calculate_sha256(export_file)
-        with open(export_file.with_suffix(".sha256"), "w") as f: f.write(file_hash)
+        with open(hash_file, "w") as f: f.write(file_hash)
+        
+        size_mb = export_file.stat().st_size / (1024 * 1024)
+        TUI.info(f"  Layer {layer_name} Complete: {size_mb:.2f} MB")
 
     TUI.step("Self-Replication")
     shutil.copy2(sys.argv[0], MOUNT_POINT / "airlock.py")
@@ -204,7 +326,7 @@ pkgs.buildEnv {{
     TUI.success("HARVEST COMPLETE. Safe to remove USB.")
 
 # --- DEPLOY MODE ---
-def deploy():
+def deploy(gc=False):
     TUI.banner()
     auto_mount_usb()
 
@@ -225,32 +347,44 @@ def deploy():
     with open("/etc/nix/nix.conf", "w") as f: f.write("trusted-users = root @wheel\nrequire-sigs = false\n")
     run_cmd(["systemctl", "enable", "--now", "nix-daemon"])
     
-    TUI.step("Importing Nix Environment")
-    export_file = NIX_TRANSFER_DIR / "tools.closure"
-    hash_file = export_file.with_suffix(".sha256")
-    local_closure = Path("/tmp/tools.closure")
+    TUI.step("Importing Nix Layers")
+    closures = sorted(list(NIX_TRANSFER_DIR.glob("*.closure")))
     
-    if export_file.exists():
-        if hash_file.exists():
-            with Spinner("Verifying Integrity (SHA256)..."):
-                expected = hash_file.read_text().strip()
-                actual = calculate_sha256(export_file)
-                if expected != actual: TUI.fail("USB Corruption Detected. Hash mismatch.")
-            TUI.info("Integrity Verified.")
-        else: TUI.warn("No hash file found. Skipping verification.")
+    if not closures:
+        TUI.warn("No Nix closures found.")
+    else:
+        for closure in closures:
+            layer_name = closure.stem
+            hash_file = closure.with_suffix(".sha256")
+            local_closure = Path(f"/tmp/{closure.name}")
+            
+            TUI.info(f"Processing Layer: {layer_name}")
+            
+            if hash_file.exists():
+                with Spinner("  Verifying Integrity..."):
+                    expected = hash_file.read_text().strip()
+                    actual = calculate_sha256(closure)
+                    if expected != actual: TUI.fail(f"Corruption detected in {layer_name}")
+            
+            with Spinner("  Importing..."):
+                shutil.copy2(closure, local_closure)
+                with open(local_closure, "r") as infile: 
+                    subprocess.run(["nix-store", "--import"], stdin=infile, check=True)
+                local_closure.unlink()
+            
+            store_paths = sorted(list(Path("/nix/store").glob(f"*-airgap-{layer_name}")))
+            if store_paths:
+                newest = store_paths[-1]
+                TUI.info(f"  Installing Profile: {newest.name}")
+                run_cmd(["nix-env", "-i", str(newest)])
+            else:
+                TUI.warn(f"  Could not find store path for {layer_name}")
 
-        with Spinner("Copying to SSD..."):
-            shutil.copy2(export_file, local_closure)
-        with Spinner("Importing to Store..."):
-            with open(local_closure, "r") as infile: subprocess.run(["nix-store", "--import"], stdin=infile, check=True)
-        
-        store_paths = sorted(list(Path("/nix/store").glob("*-airgap-tools")))
-        if store_paths:
-            newest = store_paths[-1]
-            TUI.info(f"Switching profile to: {newest.name}")
-            run_cmd(["nix-env", "-i", str(newest)])
-        local_closure.unlink()
-    else: TUI.warn("No Nix closure found.")
+    if gc:
+        TUI.step("Garbage Collection")
+        with Spinner("Removing old generations..."):
+            run_cmd(["nix-collect-garbage", "-d"])
+        TUI.success("Disk space reclaimed.")
 
     TUI.step("Priming Security")
     clam_src = REPO_DIR / "clamdb"
@@ -259,7 +393,7 @@ def deploy():
         for db in clam_src.glob("*.cvd"): shutil.copy2(db, "/var/lib/clamav/")
         run_cmd("chown -R clamav:clamav /var/lib/clamav", shell=True)
     
-    TUI.step("Configuring USBGuard (Dynamic Sensing)")
+    TUI.step("Configuring USBGuard")
     policy = run_cmd(["usbguard", "generate-policy"], capture=True)
     os.makedirs("/etc/usbguard", exist_ok=True)
     with open("/etc/usbguard/rules.conf", "w") as f: f.write(policy)
@@ -278,6 +412,30 @@ def deploy():
         subprocess.run(["systemctl", "enable", "--now", svc], stderr=subprocess.DEVNULL)
 
     TUI.success("DEPLOY COMPLETE. Please Reboot.")
+
+# --- INGEST MODE ---
+def ingest(file_path):
+    TUI.banner()
+    auto_mount_usb()
+    target = Path(file_path)
+    if not target.exists(): TUI.fail(f"File not found: {target}")
+    
+    TUI.step(f"Processing Artifact: {target.name}")
+    with Spinner("Scanning for Malware..."):
+        try: run_cmd(["clamscan", "--no-summary", str(target)])
+        except: TUI.fail("Malware Detected! Ingestion Aborted.")
+    TUI.info("ClamAV: Clean")
+
+    mime = run_cmd(["file", "--mime-type", "-b", str(target)], capture=True)
+    TUI.info(f"Detected Type: {mime}")
+    if "executable" in mime or "x-dosexec" in mime:
+        if target.suffix not in ['.exe', '.bin', '.elf']:
+            TUI.fail(f"Type Mismatch! Executable disguised as {target.suffix}")
+
+    safe_zone = Path.home() / "Safe_Zone"
+    safe_zone.mkdir(exist_ok=True)
+    shutil.copy2(target, safe_zone / target.name)
+    TUI.success(f"Imported to {safe_zone}")
 
 def init_backup(device):
     TUI.banner()
@@ -300,17 +458,39 @@ def init_backup(device):
 if __name__ == "__main__":
     if os.geteuid() != 0: sys.exit("❌ Must run as root (sudo)")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["harvest", "deploy", "init-backup"], required=True)
-    parser.add_argument("--config", nargs='+', help="Path(s) to config.json (Harvest only)")
+    parser.add_argument("--mode", choices=["harvest", "deploy", "init-backup", "search", "ingest"], required=True)
+    parser.add_argument("--config", nargs='+', help="Path(s) to config.json (Harvest only)", default=["manifest.json"])
     parser.add_argument("--device", help="Target device for init-backup")
+    parser.add_argument("--file", help="File path for ingest")
+    parser.add_argument("--add", nargs='+', help="Add packages to manifest")
+    parser.add_argument("--remove", nargs='+', help="Remove packages from manifest")
+    parser.add_argument("--list", action="store_true", help="List manifest packages")
+    parser.add_argument("--query", help="Search term")
+    parser.add_argument("--gc", action="store_true", help="Run Garbage Collection during deploy")
     
     args = parser.parse_args()
 
-    if args.mode == "harvest":
-        if not args.config: sys.exit("❌ --config required for harvest")
-        harvest(args.config)
-    elif args.mode == "deploy":
-        deploy()
+    # Config Management (Defaults to first config if multiple)
+    target_config = args.config[0] if isinstance(args.config, list) else args.config
+
+    if args.add:
+        batch_add(args.add, target_config)
+        sys.exit(0)
+    if args.remove:
+        batch_remove(args.remove, target_config)
+        sys.exit(0)
+    if args.list:
+        list_manifest(target_config)
+        sys.exit(0)
+
+    if args.mode == "harvest": harvest(args.config)
+    elif args.mode == "deploy": deploy(gc=args.gc)
     elif args.mode == "init-backup":
         if not args.device: sys.exit("❌ --device required")
         init_backup(args.device)
+    elif args.mode == "search":
+        if not args.query: sys.exit("❌ --query required")
+        interactive_search(target_config)
+    elif args.mode == "ingest":
+        if not args.file: sys.exit("❌ --file required")
+        ingest(args.file)
